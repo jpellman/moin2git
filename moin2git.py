@@ -20,7 +20,7 @@ Options:
     --convert-to-rst    After migrate, convert to reStructuredText
     --users-file        Use users_file to map wiki user to git commit author
 """
-from sh import git, python, ErrorReturnCode_1
+from sh import git, python, pandoc, ErrorReturnCode_1
 import docopt
 import os
 import re
@@ -31,6 +31,8 @@ import shutil
 
 __version__ = "0.1"
 PACKAGE_ROOT = os.path.abspath(os.path.dirname(__file__))
+CONVERSION_BLACKLIST = ['']
+HYPHEN_MANUAL_MAP = {'PythonOSOps' : "Python-OS-Ops", "GNUParallel" : "GNU-Parallel", "FrontPage" : "Home", "CWLMake" : "CWL-Make", "ITMistakes" : "IT-Mistakes", "MiscSysAdmin" : "Misc-SysAdmin", "AWSBackup" : "AWS-Backup"}
 
 
 def _unquote(encoded):
@@ -73,46 +75,62 @@ def get_versions(page, users=None, data_dir=None, convert=False):
     if not log.strip():
         return versions
 
-    logs_entries = [l.split('\t') for l in log.split('\n')]
-    for entry in logs_entries:
-        if len(entry) != 9:
-            continue
-        try:
-            content = open(os.path.join(path, 'revisions', entry[1])).read()
-        except IOError:
-            continue
-
-        date = datetime.fromtimestamp(int(entry[0][:-6]))
-        comment = entry[-1]
-        email = users.get(entry[-3], {}).get('email', 'an@nymous.com')
-        # look for name, username. default to IP
-        name = users.get(entry[-3], {}).get('name', None) or users.get(entry[-3], {}).get('username', entry[-5])
-
-        versions.append({'date': date, 'content': content,
-                         'author': "%s <%s>" % (name, email),
-                         'm': comment,
-                         'revision': entry[1]})
     if not convert:
         try:
             convert = arguments['--convert-to-rst']
         except NameError:
             convert = False
 
-    if convert:
-        conversor = os.path.join(PACKAGE_ROOT, "moin2rst", "moin2rst.py")
-        basedir = os.path.abspath(os.path.join(data_dir, '..', '..'))
+    logs_entries = [l.split('\t') for l in log.split('\n')]
+    for entry in logs_entries:
+        if len(entry) != 9:
+            continue
+        date = datetime.fromtimestamp(int(entry[0][:-6]))
+        comment = entry[-1]
+        email = users.get(entry[-3], {}).get('email', 'an@nymous.com')
+        revision = entry[1]
+        # look for name, username. default to IP
+        name = users.get(entry[-3], {}).get('name', None) or users.get(entry[-3], {}).get('username', entry[-5])
         try:
-            rst = python(conversor, _unquote(page), d=basedir)
+            content = open(os.path.join(path, 'revisions', entry[1])).read()
+        except IOError:
+            # Append blank string to content to indicate that the file was removed.
+            content = ''
+        if convert and revision != '99999999':
+            conversor = os.path.join(PACKAGE_ROOT, "moin2rst", "moin2rst.py")
+            basedir = os.path.abspath(os.path.join(data_dir, '..', '..'))
+            try:
+                rst = python(conversor, _unquote(page), d=basedir, r=str(int(revision)))
+                rst_content = rst.stdout
+            except Exception as e:
+                rst_content = ''
+                print(e)
+            #except ErrorReturnCode_1:
+            #    print("Couldn't convert %s to rst" % page)
+        else:
+            rst_content = ''
 
-            versions.append({'m': 'Converted to reStructuredText via moin2rst',
-                         'content': rst.stdout,
-                         'revision': 'Converting to rst'})
-        except ErrorReturnCode_1:
-            print("Couldn't convert %s to rst" % page)
-
+        versions.append({'date': date, 'content': content, 'rst_content': rst_content,
+                         'author': "%s <%s>" % (name, email),
+                         'm': comment,
+                         'revision': revision})
 
     return versions
 
+def _hyphenize(page):
+    '''
+    Convert transitions from lower to uppercase to hyphen delimiters.
+    '''
+    page = str(page)
+    if page in HYPHEN_MANUAL_MAP.keys():
+        return HYPHEN_MANUAL_MAP[page]
+    newpage = ''
+    for idx, elm in enumerate(page):
+        newpage+=page[idx]
+        if idx != len(page) - 1:
+            if (page[idx].islower() and page[idx+1].isupper()):
+                newpage+='-'
+    return newpage
 
 def migrate_to_git():
     if arguments['--users-file']:
@@ -131,25 +149,60 @@ def migrate_to_git():
     pages = os.listdir(root)
     os.chdir(git_repo)
     for page in pages:
+        if page in CONVERSION_BLACKLIST:
+            continue
         versions = get_versions(page, users=users, data_dir=data_dir)
         if not versions:
             print("### ignoring %s (no revisions found)" % page)
             continue
-        path = _unquote(page) + '.rst'
+        path = _hyphenize(_unquote(page)) + '.txt'
         print("### Creating %s\n" % path)
         dirname, basename = os.path.split(path)
         if dirname and not os.path.exists(dirname):
             os.makedirs(dirname)
 
         for version in versions:
-            print("revision %s" % version.pop('revision'))
-            with open(path, 'w') as f:
-                f.write(version.pop('content'))
+            revision = version.pop('revision')
+            # Handle attachment revisions
+            if revision == '99999999':
+                continue
+            print("revision %s" % revision)
             try:
-                git.add(path)
-                git.commit(path, allow_empty_message=True, **version)
-            except:
-                pass
+                if version['content']:
+                    with open(path, 'w') as f:
+                        print("Opening %s" % path)
+                        f.write(version.pop('content'))
+                    print("Adding %s" % path)
+                    git.add(path)
+                else:
+                    print("Removing %s" % path)
+                    git.rm(path)
+                    version.pop('content')
+                if version['rst_content']:
+                    with open(path.replace('txt','rst'), 'w') as f:
+                        print("Opening %s" % path.replace('txt','rst'))
+                        f.write(version.pop('rst_content'))
+                    pandoc(path.replace('txt','rst'), f="rst",t="markdown_github", o=path.replace('txt','md'))
+                    print("Adding %s" % path.replace('txt','rst'))
+                    git.add(path.replace('txt','rst'))
+                    print("Adding %s" % path.replace('txt','md'))
+                    git.add(path.replace('txt','md'))
+                elif os.path.isfile(path.replace('txt','rst')):
+                    print("Removing %s" % path.replace('txt','rst'))
+                    git.rm(path.replace('txt','rst'))
+                    print("Removing %s" % path.replace('txt','md'))
+                    git.rm(path.replace('txt','md'))
+                    version.pop('rst_content')
+                else:
+                    version.pop('rst_content')
+                print("Committing %s" % path)
+                print(version['m'])
+                if not version['m'].strip():
+                    version['m'] = "Change made on %s" % version['date'].strftime('%x')
+                git.commit(path.replace('txt','*'), **version)
+            except Exception as e:
+                print(e)
+                #pass
 
 
 def copy_attachments():
