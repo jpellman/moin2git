@@ -66,6 +66,7 @@ For a fast and dirty configuration, put your data in a directory named ``wiki``,
 
 Then copy ``moin2git/moin2rst/text_x-rst.py`` to ``wiki/data/plugins/formatters/``
 
+You may also need to copy the entire contents of ``/usr/share/moin`` into ``wiki`` as well.
 
 How it works
 ------------
